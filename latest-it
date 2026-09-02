@@ -1,3 +1,9 @@
+# Challenge 5: Outside Corners — adds the NIB_WALL state.
+# When the side wall ends (sensor returns -1), turn LEFT to wrap the corner,
+# reusing the gyro turn PID from Challenge 4 (only the direction differs).
+# Carry forward your C4 values, then tune the NIB_FORWARD_* times.
+# Guide: docs.html?doc=Challenge_5
+
 from aidriver import AIDriver, hold_state, ticks_ms, ticks_diff
 import aidriver
 
@@ -40,12 +46,22 @@ TURN_MAX_NUDGES = 6  # give up correcting after this many pulses
 TURN_CLEAR_TIME = 0.4  # drive on after a turn to leave the trigger zone
 
 # --- Trigger threshold (the logic that moves between states) ---
-FRONT_STOP_DISTANCE = 50  # front wall this close = reached -> TURN (try 100-200)
+FRONT_STOP_DISTANCE = 200  # front wall this close = reached -> TURN (try 100-200)
+
+# --- NIB_WALL parameters (you set) ---
+NIB_FORWARD_BEFORE = 0.2  # seconds forward, NO PID, BEFORE the turn (try 0.2-0.4)
+NIB_FORWARD_AFTER = 0.4  # seconds forward, NO PID, AFTER the turn (try 0.3-0.6)
+NIB_REACQUIRE_MS = 1500  # fixed: how long to creep on hunting for the new wall
+
+# --- Trigger thresholds (the logic that moves between states) ---
+NIB_LOST_DISTANCE = -1  # side past this (or -1) = lost (try 2-4x hold distance)
+NIB_CONFIRM_TIME = 0.2  # side must stay lost this long, s -> NIB_WALL (try 0.2-0.6)
 
 # --- Persistent state ---
 state = "FOLLOW_WALL"
 side_integral = 0
 side_previous_error = 0
+nib_lost_time = 0.0
 
 
 def _turn_is_right(relative_angle_deg):
@@ -158,18 +174,27 @@ def gyro_turn_pid(relative_angle_deg):
 
 def follow_wall():
     """STATE: hold the side wall with the side PID. Returns the next state."""
-    global side_integral, side_previous_error
+    global side_integral, side_previous_error, nib_lost_time
 
     front = my_robot.read_distance()
-    # Trigger -> TURN: a wall is reached straight ahead (the corner).
+    # Trigger -> TURN: a wall is reached straight ahead (dead end).
     if front != -1 and front <= FRONT_STOP_DISTANCE:
         side_integral = 0
         side_previous_error = 0
         return "TURN"
 
     side = my_robot.read_distance_2()
-    if side == -1:
-        # No side wall this tick: cruise straight until it returns.
+    # Trigger -> NIB_WALL: side wall stays lost long enough = outside corner.
+    if side != -1 and side <= NIB_LOST_DISTANCE:
+        nib_lost_time = 0.0
+    else:
+        nib_lost_time = nib_lost_time + 0.05
+        if nib_lost_time >= NIB_CONFIRM_TIME:
+            nib_lost_time = 0.0
+            side_integral = 0
+            side_previous_error = 0
+            return "NIB_WALL"
+        # Lost but not yet confirmed, nothing to steer against: go straight.
         my_robot.drive(BASE_SPEED, BASE_SPEED)
         hold_state(0.05)
         return "FOLLOW_WALL"
@@ -214,7 +239,7 @@ def follow_wall():
 
 
 def turn():
-    """STATE: wall ahead — spin 90 deg AWAY from the wall."""
+    """STATE: dead end ahead — spin 90 deg AWAY from the wall."""
     my_robot.brake()
     my_robot.clear_display()  # no I2C traffic while the gyro loop is running
     hold_state(0.3)
@@ -229,9 +254,41 @@ def turn():
     return "FOLLOW_WALL"
 
 
+def nib_wall():
+    """STATE: outside corner — wrap 90 deg TOWARD the wall."""
+    # 1. Clear the corner: the side sensor passes the wall before the wheels do.
+    my_robot.drive(BASE_SPEED, BASE_SPEED)
+    hold_state(NIB_FORWARD_BEFORE)
+    my_robot.brake()
+    hold_state(0.2)
+
+    # 2. Rotate 90 deg in the hand-on-wall direction (left wall -> spin LEFT).
+    gyro_turn_pid(-TURN_ANGLE)
+
+    # 3. Drive forward (NO PID) to come alongside the new wall.
+    my_robot.drive(BASE_SPEED, BASE_SPEED)
+    hold_state(NIB_FORWARD_AFTER)
+    my_robot.brake()
+
+    # 4. Creep on until the wall is really back, so a short NIB_FORWARD_AFTER
+    #    does not throw the run away.
+    reacquire_start = ticks_ms()
+    side = my_robot.read_distance_2()
+    while ticks_diff(ticks_ms(), reacquire_start) < NIB_REACQUIRE_MS:
+        if side != -1 and side <= NIB_LOST_DISTANCE:
+            break
+        my_robot.drive(BASE_SPEED, BASE_SPEED)
+        hold_state(0.05)
+        side = my_robot.read_distance_2()
+    my_robot.brake()
+    return "FOLLOW_WALL"
+
+
 # --- Main loop ---
 while True:
     if state == "FOLLOW_WALL":
         state = follow_wall()
     elif state == "TURN":
         state = turn()
+    elif state == "NIB_WALL":
+        state = nib_wall()
